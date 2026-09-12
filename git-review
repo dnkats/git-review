@@ -1,0 +1,133 @@
+#!/usr/bin/env bash
+# git review — review a long session's commits hunk-by-hunk, in place.
+#
+#   git review start [--base <ref>]   begin: the index becomes the checklist
+#   git review status                 what's pending / accepted
+#   git review pause                  park the checklist so commits are allowed
+#   git review resume                 bring the checklist back
+#   git review done                   record reviewed/<branch>; commit your edits
+#   git review abort                  drop the checklist (your edits stay as edits)
+#
+# Run in the checkout of the branch under review. `start` sets the index to the
+# review base — refs/reviewed/<branch> if this branch was reviewed before, else
+# the merge-base with main/master (or --base) — without touching HEAD or files.
+# VS Code's Changes view then shows every net change since the base, hunk by
+# hunk; stage a hunk to accept it (Stage Selected Ranges). The index persists
+# across sittings. Edit freely: your edits are ordinary working-tree edits and
+# the agent sees them at once. Ignore the Staged view during a review (it shows
+# the inverse diff base->HEAD).
+#
+# Commits are refused while a review is open (a pre-commit guard), because a
+# commit would snapshot the checklist, not the code. The agent runs `pause`,
+# commits, `resume`; new commits then appear as pending hunks. `done` requires
+# an empty Changes view; it moves refs/reviewed/<branch> to HEAD and, if you
+# edited anything, commits that as one "review edits" commit. History untouched.
+set -euo pipefail
+
+usage() { sed -n '2,25p' "$0"; exit "${1:-0}"; }
+
+cmd="${1:-status}"; shift || true
+base_opt=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --base) base_opt="$2"; shift 2 ;;
+    -h|--help) usage ;;
+    *) echo "unknown argument $1" >&2; usage 1 ;;
+  esac
+done
+
+gitdir=$(git rev-parse --git-dir)            # per-worktree
+marker="$gitdir/review-active"
+hook="$(git rev-parse --git-path hooks)/pre-commit"
+branch=$(git symbolic-ref --short -q HEAD) || { echo "detached HEAD; check out the branch to review" >&2; exit 1; }
+reviewed_ref="refs/reviewed/${branch}"
+parked_ref="refs/review-index/${branch}"
+
+GUARD_BEGIN='# >>> git-review guard >>>'
+GUARD_END='# <<< git-review guard <<<'
+install_guard() {
+  grep -q "$GUARD_BEGIN" "$hook" 2>/dev/null && return 0
+  if [[ ! -f "$hook" ]]; then printf '#!/usr/bin/env bash\n' > "$hook"; chmod +x "$hook"; fi
+  cat >> "$hook" <<EOF
+$GUARD_BEGIN
+if [[ -f "\$(git rev-parse --git-dir)/review-active" ]]; then
+  echo "git-review: a review is open in this checkout; the index is the checklist, not the code." >&2
+  echo "            run 'git review pause' before committing (then 'git review resume')." >&2
+  exit 1
+fi
+$GUARD_END
+EOF
+}
+
+active() { [[ -f "$marker" ]]; }
+base_of() { sed -n 's/^base //p' "$marker"; }
+
+pending_summary() {
+  local p s
+  p=$( (git diff --name-only; git ls-files --others --exclude-standard) | sort -u | wc -l)
+  s=$(git diff --cached --name-only "$(base_of)" | wc -l)
+  echo "pending: $p file(s) with unreviewed changes · accepted: $s file(s) with staged hunks"
+}
+
+case "$cmd" in
+  start)
+    active && { echo "review already open (base $(base_of | cut -c1-12)); use status/pause/done/abort" >&2; exit 1; }
+    if [[ -n "$base_opt" ]]; then base=$(git rev-parse --verify "$base_opt^{commit}"); why="$base_opt"
+    elif base=$(git rev-parse --verify -q "$reviewed_ref"); then why="reviewed/$branch"
+    else
+      for m in main master; do git rev-parse --verify -q "refs/heads/$m" >/dev/null && { base=$(git merge-base HEAD "$m"); why="merge-base with $m"; break; }; done
+      [[ -n "${base:-}" ]] || { echo "no main/master and no reviewed/$branch: give --base <ref>" >&2; exit 1; }
+    fi
+    [[ "$base" == "$(git rev-parse HEAD)" ]] && { echo "nothing to review: HEAD is at $why (${base:0:12})"; exit 0; }
+    if ! git diff --cached --quiet; then echo "index has staged changes; commit or unstage them first" >&2; exit 1; fi
+    install_guard
+    git read-tree "$base"
+    printf 'base %s\nbranch %s\n' "$base" "$branch" > "$marker"
+    echo "review open on $branch: $why (${base:0:12}) -> HEAD ($(git rev-parse --short=12 HEAD))"
+    pending_summary
+    echo "accept = stage hunks; edit freely; 'git review done' when Changes is empty"
+    ;;
+  status)
+    active || { echo "no review open on $branch"; exit 0; }
+    echo "review open on $branch: base $(base_of | cut -c1-12) -> HEAD $(git rev-parse --short=12 HEAD)"
+    pending_summary
+    ;;
+  pause)
+    active || { echo "no review open" >&2; exit 1; }
+    git update-ref "$parked_ref" "$(git write-tree)"
+    git read-tree HEAD
+    mv "$marker" "$marker.paused"
+    echo "checklist parked in $parked_ref; commits allowed. 'git review resume' to continue."
+    ;;
+  resume)
+    [[ -f "$marker.paused" ]] || { echo "nothing paused" >&2; exit 1; }
+    if ! git diff --cached --quiet; then echo "index has staged changes; commit or unstage them first" >&2; exit 1; fi
+    git read-tree "$parked_ref"
+    mv "$marker.paused" "$marker"
+    echo "review resumed on $branch (base $(base_of | cut -c1-12) -> HEAD $(git rev-parse --short=12 HEAD))"
+    pending_summary
+    ;;
+  done)
+    active || { echo "no review open" >&2; exit 1; }
+    if [[ -n "$(git status --porcelain | grep '^.[MADR?]' || true)" ]]; then
+      echo "Changes is not empty — accept (stage) or revert the rest first:" >&2
+      git status --short | grep '^.[MADR?]' >&2; exit 1
+    fi
+    rm -f "$marker"
+    if [[ "$(git write-tree)" != "$(git rev-parse 'HEAD^{tree}')" ]]; then
+      git commit -q -m "review edits on $branch"
+      echo "your edits committed: $(git rev-parse --short=12 HEAD) review edits on $branch"
+    fi
+    git update-ref "$reviewed_ref" "$(git rev-parse HEAD)"
+    git update-ref -d "$parked_ref" 2>/dev/null || true
+    echo "reviewed/$branch -> $(git rev-parse --short=12 HEAD); next 'git review start' begins here"
+    ;;
+  abort)
+    active || [[ -f "$marker.paused" ]] || { echo "no review open" >&2; exit 1; }
+    git read-tree HEAD
+    rm -f "$marker" "$marker.paused"; git update-ref -d "$parked_ref" 2>/dev/null || true
+    echo "review dropped; your edits remain as working-tree changes"
+    ;;
+  -h|--help) usage ;;
+  *) echo "unknown command $cmd" >&2; usage 1 ;;
+esac
