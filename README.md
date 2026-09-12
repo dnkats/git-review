@@ -56,13 +56,77 @@ ln -s "$PWD/git-review/git-review" ~/bin/git-review
 
 Bash and git are the only requirements.
 
-## Working with an agent
+## Scenarios
 
-Rules that make this work in a shared checkout: the agent keeps committing
-normally during a session; it never commits while a review is open (the guard
-enforces this; it can `pause`, commit, `resume` if it must); and it checks
-`git review status` at the start of any task after you reviewed, because
-your review edits are in the working tree.
+**The agent committed on a feature branch in your checkout.** The normal
+case. On that branch, `git review start`. The base is the merge-base with
+main the first time and `refs/reviewed/<branch>` after that. Accept hunks,
+edit, `git review done`.
+
+**The agent worked in a separate worktree.** Review there: `cd` into the
+worktree, `git review start`. All state is per worktree, so a review open in
+the worktree does not block commits in your main checkout and vice versa.
+`refs/reviewed/<branch>` is shared, which is what you want: it is keyed by
+branch, not by directory. Don't try to review a branch from a checkout that
+doesn't have it checked out; git refuses to check out a branch that another
+worktree holds.
+
+**The agent committed directly on main.** `git review start` alone says
+"nothing to review", because the merge-base with main is HEAD. Give the base
+once: `git review start --base origin/main`, or `--base HEAD~5`, or the
+commit you last saw. After `done`, `refs/reviewed/main` exists and the next
+`git review start` needs no `--base`.
+
+**The agent left uncommitted changes.** Ask it to commit first; that keeps
+its history and gives the review a base. If you review without a commit, the
+tool adds nothing: the Changes view already shows the working tree against
+HEAD, staging a hunk accepts it, and you commit yourself when Changes is empty.
+Committed and uncommitted work together is fine: `git review start` shows
+both as pending hunks.
+
+**Several sittings.** Stop whenever. The index persists; `git review status`
+tells you where you are. `done` only when Changes is empty. The next review
+of the same branch starts at the tree recorded by the last `done`, so
+anything already accepted is invisible, even if the agent has since amended
+or rebased its commits: the comparison is between trees, not commits.
+
+**The agent needs to keep working while you review.** In the same checkout,
+its edits appear among your pending hunks and its commits are refused by the
+guard until you `pause`. Better: let it work in another worktree or wait.
+If it must commit in this checkout, `git review pause`, commit, `git review
+resume`; the new commits show up as pending hunks. Resume on the same branch
+you paused on: the parked checklist is keyed by branch and `resume` fails
+loudly on any other.
+
+**Rejecting a hunk.** Revert it in the working tree (VS Code: Revert Selected
+Ranges, or `git checkout -p`). Now it is your edit, and `done` commits it
+with everything else you changed as one "review edits" commit. Reject by
+reverting, accept by staging; nothing else empties the Changes view.
+
+**Rebasing or merging main during a review.** Don't; `done` or `abort` first.
+A rebase after `done` is fine, but the next review will show main's changes
+as pending hunks too, because they were not in the last reviewed tree. Either
+review before you rebase, or accept the upstream hunks quickly; they are not
+the agent's.
+
+**Switching branches.** Git refuses to switch while the review's pending
+changes would be overwritten, which is most of the time. `pause`, switch,
+come back, `resume`.
+
+**A branch the agent pushed from elsewhere.** `git fetch`, check the branch
+out, `git review start`. Same as the first scenario.
+
+**After the branch is merged.** `refs/reviewed/<branch>` stays behind and is
+harmless. `git update-ref -d refs/reviewed/<branch>` removes it.
+
+## Rules for the agent
+
+The agent commits normally during a session; small, frequent commits are
+what the review wants. It never commits while a review is open (the guard
+enforces this; `pause`, commit, `resume` if it must). At the start of any
+task after you reviewed it runs `git review status`, because your review
+edits are in the working tree or in the last "review edits" commit, and they
+are the truth. It does not run `done` or `abort`; those are yours.
 
 ## State
 
