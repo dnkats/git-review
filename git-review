@@ -35,6 +35,8 @@ while [[ $# -gt 0 ]]; do
     *) echo "unknown argument $1" >&2; usage 1 ;;
   esac
 done
+# help before touching git, so `git review -h` works outside a repository
+case "$cmd" in -h|--help) usage ;; esac
 
 gitdir=$(git rev-parse --git-dir)            # per-worktree
 marker="$gitdir/review-active"
