@@ -29,6 +29,11 @@ to the checkout's `pre-commit` hook, because a commit would snapshot the
 checklist instead of the code. To commit mid-review, `git review pause`,
 commit, `git review resume`; the new commits then show up as pending hunks.
 
+The base is frozen while a review is open. Update main, work on another
+branch, come back: the pending hunks are the ones you left. When you do want
+the base moved onto an updated main, `git review rebase` rebases the branch
+and carries the checklist along (see Scenarios).
+
 `git review done` needs an empty Changes view. It moves
 `refs/reviewed/<branch>` to HEAD and, if you edited anything, commits those
 edits as one "review edits on <branch>" commit. `git review abort` drops the
@@ -41,6 +46,8 @@ git review start [--base <ref>]   begin: the index becomes the checklist
 git review status                 what's pending / accepted (the default)
 git review pause                  park the checklist so commits are allowed
 git review resume                 bring the checklist back
+git review back                   return to the review's branch after a stray checkout
+git review rebase [<upstream>]    rebase the branch and carry the checklist along
 git review done                   record reviewed/<branch>; commit your edits
 git review abort                  drop the checklist (your edits stay as edits)
 ```
@@ -54,7 +61,8 @@ git clone https://github.com/dnkats/git-review
 ln -s "$PWD/git-review/git-review" ~/bin/git-review
 ```
 
-Bash and git are the only requirements.
+Bash and git 2.38 or newer (`merge-tree --write-tree`) are the only
+requirements. `tests/run.sh` runs the scenarios below on scratch repos.
 
 ## Scenarios
 
@@ -103,15 +111,40 @@ Ranges, or `git checkout -p`). Now it is your edit, and `done` commits it
 with everything else you changed as one "review edits" commit. Reject by
 reverting, accept by staging; nothing else empties the Changes view.
 
-**Rebasing or merging main during a review.** Don't; `done` or `abort` first.
-A rebase after `done` is fine, but the next review will show main's changes
-as pending hunks too, because they were not in the last reviewed tree. Either
-review before you rebase, or accept the upstream hunks quickly; they are not
-the agent's.
+**A long review, and main moves on.** Nothing happens to the review: the
+base is frozen. `pause` if you need to commit or switch branches, work
+elsewhere, update main, come back, `resume`, and the checklist is as you left
+it plus whatever the agent committed on the branch meanwhile.
 
-**Switching branches.** Git refuses to switch while the review's pending
-changes would be overwritten, which is most of the time. `pause`, switch,
-come back, `resume`.
+**Moving the base onto the updated main.** `git review rebase` (or `git
+review rebase <upstream>`). It parks the checklist, runs `git rebase
+--autostash <upstream>`, then carries the checklist onto the new upstream by
+a three-way merge of trees: accepted hunks stay accepted, unreviewed hunks
+stay pending, and main's changes do not appear at all. If the rebase itself
+stops on a conflict, resolve it as usual (`git rebase --continue` or
+`--abort`), then `git review resume`; the carry happens there. A file where
+main conflicts with a hunk you had accepted keeps its pre-rebase checklist,
+so main's changes in that file show up as pending and you look at it once
+more; the tool says which files. Merging main into the branch instead of
+rebasing: `pause`, merge, `resume` leaves main's hunks pending; use
+`git review rebase` if you want them gone, or accept them.
+
+**Rebasing or merging between sittings.** After `done`, rebase or merge as
+you like. The next `git review start` notices that the branch now sits on a
+newer main and carries the reviewed tree onto it, so only the agent's new
+work is pending. Same conflict rule as above.
+
+**Switching branches.** `pause` first. Git often refuses to switch with a
+review open, since pending changes would be overwritten. When it doesn't
+refuse, you end up on the other branch with the checklist still in the
+index, a `post-checkout` guard tells you so, and git then refuses to switch
+back. `git review back` repoints HEAD to the review's branch without touching
+your files and undoes what the checkout rewrote. Paths the branch never
+changed come back clean; pending hunks and your edits were never touched.
+The paths the branch did change and the checkout rewrote come back pending,
+because whether you had accepted or rejected them cannot be told after the
+fact; the command lists them and you accept or reject once more. Every other
+command refuses on the wrong branch.
 
 **A branch the agent pushed from elsewhere.** `git fetch`, check the branch
 out, `git review start`. Same as the first scenario.
@@ -132,6 +165,7 @@ are the truth. It does not run `done` or `abort`; those are yours.
 
 Everything lives inside `.git` and is per worktree: `review-active` (the
 marker with the base), `refs/reviewed/<branch>` (where the last review ended),
-`refs/review-index/<branch>` (a parked checklist during `pause`), and the
-guard block in `hooks/pre-commit`. Delete those and the tool has never been
+`refs/review-index/<branch>` (a parked checklist during `pause` and
+`rebase`), `review-active.rebase` (a rebase in flight), and the guard blocks in
+`hooks/pre-commit` and `hooks/post-checkout`. After a carry the recorded base is a tree, not a commit. Delete those and the tool has never been
 there.

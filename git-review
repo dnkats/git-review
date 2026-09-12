@@ -5,6 +5,8 @@
 #   git review status                 what's pending / accepted
 #   git review pause                  park the checklist so commits are allowed
 #   git review resume                 bring the checklist back
+#   git review back                   return to the review's branch after a stray checkout
+#   git review rebase [<upstream>]    rebase the branch and carry the checklist along
 #   git review done                   record reviewed/<branch>; commit your edits
 #   git review abort                  drop the checklist (your edits stay as edits)
 #
@@ -22,17 +24,26 @@
 # commits, `resume`; new commits then appear as pending hunks. `done` requires
 # an empty Changes view; it moves refs/reviewed/<branch> to HEAD and, if you
 # edited anything, commits that as one "review edits" commit. History untouched.
+#
+# The base is frozen while a review is open: update main, work elsewhere, come
+# back, and the pending hunks are the ones you left. To move the base onto an
+# updated main, `git review rebase`: it rebases the branch and carries the
+# checklist along by a three-way merge, so accepted hunks stay accepted and
+# main's changes do not show up as pending. `start` does the same carry by
+# itself when the branch was rebased or merged with main since the last `done`.
+# A file where main conflicts with the checklist is shown fully pending.
 set -euo pipefail
 
-usage() { sed -n '2,25p' "$0"; exit "${1:-0}"; }
+usage() { sed -n '2,32p' "$0"; exit "${1:-0}"; }
 
 cmd="${1:-status}"; shift || true
-base_opt=""
+base_opt=""; upstream_opt=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --base) base_opt="$2"; shift 2 ;;
     -h|--help) usage ;;
-    *) echo "unknown argument $1" >&2; usage 1 ;;
+    *) if [[ "$cmd" == rebase && -z "$upstream_opt" ]]; then upstream_opt="$1"; shift
+       else echo "unknown argument $1" >&2; usage 1; fi ;;
   esac
 done
 # help before touching git, so `git review -h` works outside a repository
@@ -41,28 +52,54 @@ case "$cmd" in -h|--help) usage ;; esac
 gitdir=$(git rev-parse --git-dir)            # per-worktree
 marker="$gitdir/review-active"
 hook="$(git rev-parse --git-path hooks)/pre-commit"
-branch=$(git symbolic-ref --short -q HEAD) || { echo "detached HEAD; check out the branch to review" >&2; exit 1; }
+if ! branch=$(git symbolic-ref --short -q HEAD); then
+  if [[ -f "$gitdir/review-active.rebase" ]]; then
+    echo "review paused for a rebase that stopped; finish it (git rebase --continue / --abort), then 'git review resume'" >&2
+  else
+    echo "detached HEAD; check out the branch to review" >&2
+  fi
+  exit 1
+fi
 reviewed_ref="refs/reviewed/${branch}"
 parked_ref="refs/review-index/${branch}"
 
 GUARD_BEGIN='# >>> git-review guard >>>'
 GUARD_END='# <<< git-review guard <<<'
+# append_hook <name> <body>: add the guard block to hooks/<name> once
+append_hook() {
+  local file; file="$(git rev-parse --git-path hooks)/$1"
+  grep -q "$GUARD_BEGIN" "$file" 2>/dev/null && return 0
+  if [[ ! -f "$file" ]]; then printf '#!/usr/bin/env bash\n' > "$file"; chmod +x "$file"; fi
+  printf '%s\n%s\n%s\n' "$GUARD_BEGIN" "$2" "$GUARD_END" >> "$file"
+}
 install_guard() {
-  grep -q "$GUARD_BEGIN" "$hook" 2>/dev/null && return 0
-  if [[ ! -f "$hook" ]]; then printf '#!/usr/bin/env bash\n' > "$hook"; chmod +x "$hook"; fi
-  cat >> "$hook" <<EOF
-$GUARD_BEGIN
-if [[ -f "\$(git rev-parse --git-dir)/review-active" ]]; then
+  # commits are refused while a review is open: the index is the checklist
+  append_hook pre-commit 'if [[ -f "$(git rev-parse --git-dir)/review-active" ]]; then
   echo "git-review: a review is open in this checkout; the index is the checklist, not the code." >&2
-  echo "            run 'git review pause' before committing (then 'git review resume')." >&2
+  echo "            run '"'"'git review pause'"'"' before committing (then '"'"'git review resume'"'"')." >&2
   exit 1
-fi
-$GUARD_END
-EOF
+fi'
+  # a branch switch away from an open review is loud: `git review back` undoes it
+  append_hook post-checkout 'm="$(git rev-parse --git-dir)/review-active"
+if [[ "${3:-0}" == 1 && -f "$m" && "$(git symbolic-ref --short -q HEAD)" != "$(sed -n "s/^branch //p" "$m")" ]]; then
+  echo "git-review: a review is open on $(sed -n "s/^branch //p" "$m") and you just left it; run '"'"'git review back'"'"' before editing anything." >&2
+fi'
 }
 
 active() { [[ -f "$marker" ]]; }
+marker_branch() { sed -n 's/^branch //p' "$marker" 2>/dev/null; }
 base_of() { sed -n 's/^base //p' "$marker"; }
+upstream_of() { sed -n 's/^upstream //p' "$marker"; }   # the main commit the base sits on, if known
+short() { git rev-parse --short=12 "$1"; }
+
+# The main/master branch, or the given name; empty when there is none.
+upstream_branch() {
+  local m
+  if [[ -n "${1:-}" ]]; then git rev-parse --verify -q "refs/heads/$1" >/dev/null && echo "$1"; return; fi
+  for m in main master; do
+    git rev-parse --verify -q "refs/heads/$m" >/dev/null && { echo "$m"; return; }
+  done
+}
 
 pending_summary() {
   local p s
@@ -71,27 +108,139 @@ pending_summary() {
   echo "pending: $p file(s) with unreviewed changes · accepted: $s file(s) with staged hunks"
 }
 
+# carry <tree-ish> <old upstream> <new upstream>: the tree-ish rebased onto the
+# new upstream by a three-way merge; the resulting tree id on stdout. A path
+# where the two sides conflict keeps the tree-ish's version, so it shows as
+# fully pending instead of carrying conflict markers.
+carry() {
+  local out rc merged tmp path entry conflicted
+  set +e
+  out=$(git merge-tree --write-tree --name-only --merge-base="$2" "$1" "$3" 2>/dev/null); rc=$?
+  set -e
+  merged=${out%%$'\n'*}
+  if (( rc == 0 )); then echo "$merged"; return 0; fi
+  (( rc == 1 )) || { echo "git merge-tree failed while carrying the checklist" >&2; return 1; }
+  conflicted=$(printf '%s\n' "$out" | sed -n '2,/^$/p' | sed '/^$/d')
+  tmp=$(mktemp -u)
+  GIT_INDEX_FILE="$tmp" git read-tree "$merged"
+  while IFS= read -r path; do
+    [[ -n "$path" ]] || continue
+    entry=$(git ls-tree "$1" -- "$path")
+    if [[ -n "$entry" ]]; then
+      printf '%s %s\t%s\n' "${entry%% *}" "$(echo "$entry" | cut -d' ' -f3 | cut -f1)" "$path" \
+        | GIT_INDEX_FILE="$tmp" git update-index --index-info
+    else
+      GIT_INDEX_FILE="$tmp" git update-index --force-remove -- "$path"
+    fi
+  done <<< "$conflicted"
+  GIT_INDEX_FILE="$tmp" git write-tree
+  rm -f "$tmp"
+  echo "carry: $(printf '%s\n' "$conflicted" | wc -l) file(s) conflict with main and are shown fully pending:" >&2
+  printf '%s\n' "$conflicted" | sed 's/^/  /' >&2
+}
+
+# Bring a parked checklist back; carry it first if a `rebase` moved the branch.
+resume_review() {
+  local up mb new_up base checklist
+  if ! git diff --cached --quiet; then echo "index has staged changes; commit or unstage them first" >&2; exit 1; fi
+  checklist=$(git rev-parse "$parked_ref")
+  base=$(sed -n 's/^base //p' "$marker.paused")
+  if [[ -f "$marker.rebase" ]]; then
+    up=$(sed -n 's/^upstream //p' "$marker.rebase")
+    mb=$(sed -n 's/^mergebase //p' "$marker.rebase")
+    new_up=$(git merge-base HEAD "$up")
+    if [[ "$new_up" != "$mb" ]]; then
+      checklist=$(carry "$checklist" "$mb" "$new_up")
+      base=$(carry "$base" "$mb" "$new_up" 2>/dev/null)
+      sed -i "/^base /s/.*/base $base/; /^upstream /d" "$marker.paused"
+      echo "upstream $new_up" >> "$marker.paused"
+      echo "checklist carried onto $up ($(short "$new_up"))"
+    fi
+    rm -f "$marker.rebase"
+  fi
+  git read-tree "$checklist"
+  mv "$marker.paused" "$marker"
+  echo "review resumed on $branch (base $(base_of | cut -c1-12) -> HEAD $(short HEAD))"
+  pending_summary
+}
+
+# A review belongs to the branch it was started on; git lets you switch
+# branches with the checklist in the index when no file is in the way, and
+# then every command here would read the wrong HEAD.
+if active && [[ "$(marker_branch)" != "$branch" ]]; then
+  case "$cmd" in
+    status) echo "review open on $(marker_branch), not on $branch; 'git review back' returns to it"; exit 0 ;;
+    back)
+      # Git may refuse `git checkout <review branch>` now, because the index
+      # holds the checklist. Repoint HEAD without touching files, then undo
+      # what the stray checkout did: it rewrote the paths that differ between
+      # the two branches and were clean, leaving them at this branch's
+      # content. Whether such a hunk had been accepted or rejected cannot be
+      # told after the fact, so those paths come back PENDING: the worktree
+      # at the branch's content, the index at the base's. Paths the branch
+      # never changed come back clean; the others are named for re-review.
+      review_branch=$(marker_branch); other=$(git rev-parse 'HEAD^{tree}'); base=$(base_of)
+      git symbolic-ref HEAD "refs/heads/$review_branch"
+      again=()
+      while IFS= read -r path; do
+        [[ -n "$path" ]] || continue
+        git diff --quiet -- "$path" || continue                    # edited on top: leave it
+        git diff --cached --quiet "$other" -- "$path" || continue  # not at the other branch's content: untouched
+        if git cat-file -e "HEAD:$path" 2>/dev/null; then git checkout -q HEAD -- "$path"
+        else git rm -q --cached -- "$path"; rm -f -- "$path"; fi
+        git reset -q "$base" -- "$path"
+        git diff --quiet -- "$path" || again+=("$path")
+      done < <(git diff --name-only "$other" HEAD)
+      branch="$review_branch"
+      echo "back on $branch"
+      if (( ${#again[@]} )); then
+        echo "pending again, accept or reject once more:"
+        printf '  %s\n' "${again[@]}"
+      fi
+      pending_summary; exit 0 ;;
+    *) echo "review open on $(marker_branch), not on $branch; 'git review back' returns to it" >&2; exit 1 ;;
+  esac
+fi
+
 case "$cmd" in
   start)
     active && { echo "review already open (base $(base_of | cut -c1-12)); use status/pause/done/abort" >&2; exit 1; }
+    [[ -f "$marker.paused" ]] && { echo "a paused review exists; 'git review resume' or 'git review abort'" >&2; exit 1; }
+    up=$(upstream_branch); upstream=""
     if [[ -n "$base_opt" ]]; then base=$(git rev-parse --verify "$base_opt^{commit}"); why="$base_opt"
-    elif base=$(git rev-parse --verify -q "$reviewed_ref"); then why="reviewed/$branch"
+    elif base=$(git rev-parse --verify -q "$reviewed_ref"); then
+      why="reviewed/$branch"
+      if [[ -n "$up" ]]; then
+        # The branch was rebased onto, or merged with, a newer main since the
+        # last review: carry the reviewed tree onto that main, so only the
+        # agent's new work is pending, not main's.
+        mb=$(git merge-base "$base" "$up"); new_up=$(git merge-base HEAD "$up")
+        if [[ "$mb" != "$new_up" ]]; then
+          base=$(carry "$base" "$mb" "$new_up"); upstream="$new_up"
+          why="reviewed/$branch carried onto $up"
+        fi
+      fi
     else
-      for m in main master; do git rev-parse --verify -q "refs/heads/$m" >/dev/null && { base=$(git merge-base HEAD "$m"); why="merge-base with $m"; break; }; done
-      [[ -n "${base:-}" ]] || { echo "no main/master and no reviewed/$branch: give --base <ref>" >&2; exit 1; }
+      [[ -n "$up" ]] || { echo "no main/master and no reviewed/$branch: give --base <ref>" >&2; exit 1; }
+      base=$(git merge-base HEAD "$up"); why="merge-base with $up"; upstream="$base"
     fi
-    [[ "$base" == "$(git rev-parse HEAD)" ]] && { echo "nothing to review: HEAD is at $why (${base:0:12})"; exit 0; }
+    [[ "$(git rev-parse "$base^{tree}")" == "$(git rev-parse 'HEAD^{tree}')" ]] && { echo "nothing to review: HEAD is at $why (${base:0:12})"; exit 0; }
     if ! git diff --cached --quiet; then echo "index has staged changes; commit or unstage them first" >&2; exit 1; fi
     install_guard
     git read-tree "$base"
     printf 'base %s\nbranch %s\n' "$base" "$branch" > "$marker"
-    echo "review open on $branch: $why (${base:0:12}) -> HEAD ($(git rev-parse --short=12 HEAD))"
+    [[ -n "$upstream" ]] && echo "upstream $upstream" >> "$marker"
+    echo "review open on $branch: $why (${base:0:12}) -> HEAD ($(short HEAD))"
     pending_summary
     echo "accept = stage hunks; edit freely; 'git review done' when Changes is empty"
     ;;
   status)
+    if [[ -f "$marker.rebase" ]]; then
+      echo "review paused on $branch for a rebase; finish it (git rebase --continue / --abort), then 'git review resume'"; exit 0
+    fi
+    [[ -f "$marker.paused" ]] && { echo "review paused on $branch; 'git review resume' to continue"; exit 0; }
     active || { echo "no review open on $branch"; exit 0; }
-    echo "review open on $branch: base $(base_of | cut -c1-12) -> HEAD $(git rev-parse --short=12 HEAD)"
+    echo "review open on $branch: base $(base_of | cut -c1-12) -> HEAD $(short HEAD)"
     pending_summary
     ;;
   pause)
@@ -103,11 +252,26 @@ case "$cmd" in
     ;;
   resume)
     [[ -f "$marker.paused" ]] || { echo "nothing paused" >&2; exit 1; }
-    if ! git diff --cached --quiet; then echo "index has staged changes; commit or unstage them first" >&2; exit 1; fi
-    git read-tree "$parked_ref"
-    mv "$marker.paused" "$marker"
-    echo "review resumed on $branch (base $(base_of | cut -c1-12) -> HEAD $(git rev-parse --short=12 HEAD))"
-    pending_summary
+    [[ "$(sed -n 's/^branch //p' "$marker.paused")" == "$branch" ]] || { echo "the paused review is on $(sed -n 's/^branch //p' "$marker.paused"); check that branch out to resume" >&2; exit 1; }
+    resume_review
+    ;;
+  rebase)
+    active || { echo "no review open (a paused one: resume it first, or finish its rebase)" >&2; exit 1; }
+    up=$(upstream_branch "$upstream_opt")
+    [[ -n "$up" ]] || { echo "no such branch: ${upstream_opt:-main/master}" >&2; exit 1; }
+    base=$(base_of); mb=$(upstream_of)
+    [[ -n "$mb" ]] || mb=$(git merge-base "$base" "$up")
+    git update-ref "$parked_ref" "$(git write-tree)"
+    git read-tree HEAD
+    mv "$marker" "$marker.paused"
+    printf 'upstream %s\nmergebase %s\n' "$up" "$mb" > "$marker.rebase"
+    echo "checklist parked; rebasing $branch onto $up"
+    if git rebase --autostash "$up"; then
+      resume_review
+    else
+      echo "rebase stopped. Finish it (git rebase --continue, or --abort), then 'git review resume'." >&2
+      exit 1
+    fi
     ;;
   done)
     active || { echo "no review open" >&2; exit 1; }
@@ -118,18 +282,18 @@ case "$cmd" in
     rm -f "$marker"
     if [[ "$(git write-tree)" != "$(git rev-parse 'HEAD^{tree}')" ]]; then
       git commit -q -m "review edits on $branch"
-      echo "your edits committed: $(git rev-parse --short=12 HEAD) review edits on $branch"
+      echo "your edits committed: $(short HEAD) review edits on $branch"
     fi
     git update-ref "$reviewed_ref" "$(git rev-parse HEAD)"
     git update-ref -d "$parked_ref" 2>/dev/null || true
-    echo "reviewed/$branch -> $(git rev-parse --short=12 HEAD); next 'git review start' begins here"
+    echo "reviewed/$branch -> $(short HEAD); next 'git review start' begins here"
     ;;
   abort)
     active || [[ -f "$marker.paused" ]] || { echo "no review open" >&2; exit 1; }
     git read-tree HEAD
-    rm -f "$marker" "$marker.paused"; git update-ref -d "$parked_ref" 2>/dev/null || true
+    rm -f "$marker" "$marker.paused" "$marker.rebase"; git update-ref -d "$parked_ref" 2>/dev/null || true
     echo "review dropped; your edits remain as working-tree changes"
     ;;
-  -h|--help) usage ;;
+  back) echo "already on $branch, the review's branch" ;;
   *) echo "unknown command $cmd" >&2; usage 1 ;;
 esac
