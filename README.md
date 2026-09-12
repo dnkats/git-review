@@ -39,6 +39,53 @@ and carries the checklist along (see Scenarios).
 edits as one "review edits on <branch>" commit. `git review abort` drops the
 checklist and keeps your edits as working-tree changes.
 
+## In VS Code
+
+Open the Source Control view (the branch icon in the activity bar, or
+Ctrl+Shift+G). With a review open it shows two groups. Changes is the
+checklist: every file with something you have not accepted yet. Staged
+Changes is the mirror image of the checklist against HEAD; collapse it and
+leave it collapsed. Everything below happens in Changes and in the diff
+editor you get by clicking a file there.
+
+![The Changes group with its hover actions](docs/changes-view.png)
+
+Accepting works at three sizes. Hover a hunk in the diff editor and a small
+widget appears in the gutter beside it: `+` is Stage Block, which accepts
+that hunk, and the curved arrow is Revert Block, which rejects it by putting
+the base's text back.
+
+![Stage Block and Revert Block in the gutter](docs/hunk-actions.png)
+
+For part of a hunk, select the lines you want and right-click: Stage Selected
+Ranges accepts just those lines (Ctrl+K Ctrl+Alt+S), Revert Selected Ranges
+rejects them (Ctrl+K Ctrl+R). The rest of the hunk stays pending.
+
+![Stage Selected Ranges and Revert Selected Ranges in the context menu](docs/selected-ranges.png)
+
+For a whole file, hover its row in Changes and click `+` (Stage Changes); the
+curved arrow (Discard Changes) rejects the whole file, including your own
+edits in it. The same two icons on the Changes header act on every remaining
+file, which is how you end a review whose tail you have already read.
+
+![Stage Changes on a file row](docs/file-actions.png)
+
+An accepted hunk disappears from the diff; when a file has nothing pending
+it leaves Changes. `git review done` when the group is empty.
+
+![The diff after one block was staged](docs/after-stage.png)
+
+Editing while you review is just editing: change the text in the diff
+editor, save, and the hunk now shows your version. Accept it like any other
+hunk. New files the agent added appear with a U; staging one accepts it.
+Deleted files appear with a D; staging accepts the deletion.
+
+Moving between hunks: Alt+F5 and Shift+Alt+F5 jump to the next and previous
+change in the file, the arrows in the diff editor's title bar do the same,
+and the file list is the order across files. The inline diff shown above is
+VS Code's default for a narrow editor; the side-by-side view works the same,
+with the actions on the right-hand (working tree) side.
+
 ## Commands
 
 ```
